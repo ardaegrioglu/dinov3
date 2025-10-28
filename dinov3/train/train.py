@@ -49,7 +49,7 @@ logger = logging.getLogger("dinov3")
 
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv3 training", add_help=add_help)
-    parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
+    parser.add_argument("--config-file", default="dinov3/configs/train/vitl_gram_anchor.yaml", metavar="FILE", help="path to config file")
     parser.add_argument(
         "--no-resume",
         action="store_true",
@@ -403,7 +403,7 @@ def do_train(cfg, model, resume=False):
     start_iter = 0
     if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
-        start_iter = (
+        loaded_iter = (
             load_checkpoint(
                 last_checkpoint_dir,
                 model=model,
@@ -411,8 +411,13 @@ def do_train(cfg, model, resume=False):
                 strict_loading=False,
                 process_group=process_subgroup,
             )
-            + 1
+            
         )
+        if(isinstance(loaded_iter, str)):
+                import re
+                match = re.search(r'\d+', loaded_iter)
+                loaded_iter = int(match.group()) if match else 0
+        start_iter = loaded_iter + 1
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
     if cfg.multidistillation.enabled:
@@ -434,7 +439,10 @@ def do_train(cfg, model, resume=False):
     # Manual garbage collection
     gc.disable()
     gc.collect()
-
+    if distributed.is_main_process():
+        import wandb
+        wandb_run = wandb.init(project="dinov3", name="Training Run continuation close to gram loss kicking in")
+        wandb_run.watch(model, log="all", log_freq=1000)
     # Training loop
     student = model.student
     iteration = start_iter
@@ -483,7 +491,64 @@ def do_train(cfg, model, resume=False):
         # Forward backward
         optimizer.zero_grad(set_to_none=True)
         total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+        loss_dict = metrics_dict
 
+
+        # Organize losses into separate graphs using different prefixes
+        wandb_log_dict = {}
+
+        # DINO Loss Graph
+        if "dino_local_crops_loss" in loss_dict:
+            dino_loss_val = loss_dict["dino_local_crops_loss"].item() if hasattr(loss_dict["dino_local_crops_loss"], 'item') else loss_dict["dino_loss"]
+            wandb_log_dict["dino/loss"] = dino_loss_val
+            # Add weight and weighted loss if you have access to model weights
+            try:
+                wandb_log_dict["dino/dino_local_loss_weight"] = loss_dict["dino_local_loss_weight"]
+                wandb_log_dict["dino/weighted_loss"] = loss_dict["dino_local_loss_weight"] * dino_loss_val
+            except AttributeError:
+                pass
+
+        # KoLeo Loss Graph  
+        if "koleo_loss" in loss_dict:
+            koleo_loss_val = loss_dict["koleo_loss"].item() if hasattr(loss_dict["koleo_loss"], 'item') else loss_dict["koleo_loss"]
+            wandb_log_dict["koleo/loss"] = koleo_loss_val
+            try:
+                wandb_log_dict["koleo/weight"] = model.koleo_loss_weight
+                wandb_log_dict["koleo/weighted_loss"] = model.koleo_loss_weight * koleo_loss_val
+            except AttributeError:
+                pass
+
+        # iBOT Loss Graph
+        if "ibot_loss" in loss_dict:
+            ibot_loss_val = loss_dict["ibot_loss"].item() if hasattr(loss_dict["ibot_loss"], 'item') else loss_dict["ibot_loss"]
+            wandb_log_dict["ibot/loss"] = ibot_loss_val
+            try:
+                wandb_log_dict["ibot/weight"] = model.ibot_loss_weight
+                wandb_log_dict["ibot/weighted_loss"] = model.ibot_loss_weight * ibot_loss_val
+            except AttributeError:
+                pass
+
+        # Gram Loss Graph (if enabled)
+        if "gram_loss" in loss_dict:
+            gram_loss_val = loss_dict["gram_loss"].item() if hasattr(loss_dict["gram_loss"], 'item') else loss_dict["gram_loss"]
+            wandb_log_dict["gram/loss"] = gram_loss_val
+    
+            if "gram_loss_weight" in loss_dict:
+                gram_weight = loss_dict["gram_loss_weight"]
+                wandb_log_dict["gram/weight"] = gram_weight
+                wandb_log_dict["gram/weighted_loss"] = gram_loss_val * gram_weight
+
+        # Gram Stats Graph (if enabled)
+        if "stats_only/masked_gram_loss" in loss_dict:
+            wandb_log_dict["gram_stats/masked_loss"] = loss_dict["stats_only/masked_gram_loss"].item() if hasattr(loss_dict["stats_only/masked_gram_loss"], 'item') else loss_dict["stats_only/masked_gram_loss"]
+
+        if "stats_only/unmasked_gram_loss" in loss_dict:
+            wandb_log_dict["gram_stats/unmasked_loss"] = loss_dict["stats_only/unmasked_gram_loss"].item() if hasattr(loss_dict["stats_only/unmasked_gram_loss"], 'item') else loss_dict["stats_only/unmasked_gram_loss"]
+            
+
+        # Log to wandb
+        if distributed.is_main_process():
+            wandb_run.log(wandb_log_dict, step=iteration)
         # Gradient clipping
         if cfg.optim.clip_grad:
             for k, v in student.items():
@@ -549,7 +614,8 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(total_loss=total_loss, **metrics_dict)
-
+        if distributed.is_main_process():
+            wandb_run.log({"lr": lr, "wd": wd, "mom": mom, "last_layer_lr":last_layer_lr, "total_loss":total_loss})
         # Submit evaluation jobs
         if (
             cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
@@ -593,6 +659,9 @@ def main(argv=None):
         logger.info("setup_multidistillation done")
         assert cfg.MODEL.META_ARCHITECTURE == "MultiDistillationMetaArch"
     else:
+        #breakpoint()
+        print("train args")
+        print(args)
         setup_job(output_dir=args.output_dir, seed=args.seed)
         cfg = setup_config(args, strict_cfg=False)
         logger.info(cfg)

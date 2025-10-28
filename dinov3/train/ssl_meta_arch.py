@@ -607,7 +607,7 @@ class SSLMetaArch(nn.Module):
             teacher_probs=teacher_global["cls_centered"],
         )
         loss_dict["dino_local_crops_loss"] = dino_local_crops_loss
-
+        
         # Reweighting of DINO loss
         if self.cfg.dino.reweight_dino_local_loss:
             local_weight = self.dino_local_loss_schedule[iteration]

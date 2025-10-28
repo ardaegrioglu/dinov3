@@ -1,7 +1,5 @@
-# tested on RSC: /checkpoint/dino/qas/rope/vitl16_im1k/
-# gives 82.2 im1k-knn, 83.3 im1k-linear
-# runs with a total batch size of 2048 (64/gpu, 4 nodes here)
-# runs at 0.57s/iter
+# ViT-Large/16 with Gram Anchoring Configuration
+# Based on vitl_im1k_lin834.yaml but with gram loss enabled
 MODEL:
   META_ARCHITECTURE: SSLMetaArch
   DEVICE: cuda
@@ -23,7 +21,16 @@ dino:
   koleo_loss_distributed: false
   koleo_topk: 1
   koleo_distributed_replicas: 0
+  koleo_distributed_loss_group_size: null
+  koleo_distributed_loss_group_data: true
   force_weight_norm: false
+  reweight_dino_local_loss: true
+  local_loss_weight_schedule:
+    start: 1
+    peak: 1
+    end: 0.5
+    warmup_epochs: 100
+    cosine_epochs: 1
 ibot:
   loss_weight: 1.0
   mask_sample_probability: 0.5
@@ -38,25 +45,50 @@ ibot:
   head_norm_last_layer: false
   head_nlayers: 3
   head_hidden_dim: 2048
+gram:
+  use_loss: true
+  compute_stats: false
+  loss_weight: 1.0
+  ema_teacher: false
+  ckpt: ignore
+  it_load_ema_teacher: -1
+  rep_update: true
+  update_frequency: 5000  # Adjusted for ViT-L (shorter than 7B)
+  it_first_update: 100000  # Adjusted for ViT-L (shorter than 7B)
+  max_updates: 3
+  normalized: true
+  img_level: true
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+  loss_weight_schedule:
+    start: 0
+    peak: 0
+    end: 2.0
+    warmup_epochs: 100
+    cosine_epochs: 1
 train:
-  batch_size_per_gpu: 64
-  dataset_path: ImageNet:split=TRAIN
-  output_dir: /checkpoint/dino/qas/rope/vitl16_im1k
+  batch_size_per_gpu: 32  # Adjusted for ViT-L (can use larger batch size)
+  dataset_path: null
   saveckp_freq: 20
   seed: 0
   num_workers: 10
-  OFFICIAL_EPOCH_LENGTH: 1250
+  OFFICIAL_EPOCH_LENGTH: 1250  # Keep same as original ViT-L config
   monitor_gradient_norm: false
   chunk_schedule: []
   cache_dataset: true
   use_teacher_head: true
   learn_from_teacher_tokens: false
   centering: sinkhorn_knopp
-  checkpointing: false
+  checkpointing: true
+  checkpointing_full: true
   compile: true
   cudagraphs: false
   cell_augmentation: false
   cell_augmentation_type: hpa
+  sharded_eval_checkpoint: false
 student:
   arch: vit_large
   patch_size: 16
@@ -78,13 +110,13 @@ student:
   pos_embed_rope_base: 100.0
   pos_embed_rope_min_period: null
   pos_embed_rope_max_period: null
-  pos_embed_rope_normalize_coords: separate  # min, max, separate
+  pos_embed_rope_normalize_coords: separate
   pos_embed_rope_shift_coords: null
   pos_embed_rope_jitter_coords: null
   pos_embed_rope_rescale_coords: null
   pos_embed_rope_dtype: bf16
-  fp8_enabled: False  # Convert Linear layers to operate in fp8 precision
-  fp8_filter: "blocks"  # Regex that must appear in module path; empty means everything
+  fp8_enabled: false
+  fp8_filter: "blocks"
 teacher:
   momentum_teacher: 0.992
   final_momentum_teacher: 1
@@ -102,15 +134,15 @@ hrft:
   enabled: false
   checkpoint_path: ''
 optim:
-  epochs: 100
+  epochs: 200  # Increased for gram anchoring (was 100 in original)
   optimizer: adamw
   weight_decay: 0.04
   weight_decay_end: 0.4
-  lr: 0.001
-  warmup_epochs: 10
+  lr: 0.0008  # Slightly reduced for stability with gram loss
+  warmup_epochs: 20
   min_lr: 1.0e-06
   clip_grad: 3.0
-  freeze_last_layer_epochs: 1
+  freeze_last_layer_epochs: 5
   scaling_rule: sqrt_wrt_1024
   patch_embed_lr_mult: 0.2
   dino_head_wd_multiplier: 1.0
@@ -129,9 +161,19 @@ crops:
   - 0.32
   global_crops_size: 224
   local_crops_size: 96
+  gram_teacher_crops_size: 256  # Added for gram teacher
   localcrops_subset_of_globalcrops: false
   share_color_jitter: false
-  horizontal_flips: true
+  horizontal_flips: false  # Changed to false for gram anchoring
+  gram_teacher_no_distortions: true  # Added for gram teacher
+  rgb_mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  rgb_std:
+  - 0.229
+  - 0.224
+  - 0.225
 evaluation:
   eval_period_iterations: 12500
   low_freq_every: 5
@@ -141,3 +183,26 @@ evaluation:
 checkpointing:
   period: 3750
   max_to_keep: 3
+  keep_every: 50000
+schedules:
+  lr:
+    start: 0
+    peak: 0.0008
+    end: 1.0e-06
+    warmup_epochs: 20
+    freeze_last_layer_epochs: 5
+  weight_decay:
+    start: 0.04
+    peak: 0.04
+    end: 0.4
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.04
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 30
+  momentum:
+    start: 0.992
+    peak: 0.992
+    end: 1.0
+    warmup_epochs: 0
