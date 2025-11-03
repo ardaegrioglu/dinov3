@@ -25,7 +25,7 @@ class ImageNetSDataset(Dataset):
     ):
         """
         Args:
-            root_dir: Path to ImageNet-S dataset root
+            root_dir: Path to ImageNet-S dataset root (should contain ImageNetS919 folder)
             split: 'train' or 'val'
             resolution: Input image resolution (224)
             transform: Image transforms
@@ -37,20 +37,28 @@ class ImageNetSDataset(Dataset):
         
         # Dataset structure:
         # root_dir/
-        #   ├── ImageNetS50/
-        #   │   ├── train-semi/  (or train-full)
-        #   │   └── validation/
-        #   └── ImageNetS300/
-        #       ├── train-semi/
-        #       └── validation/
+        #   └── ImageNetS919/
+        #       ├── train-semi/         # training images with annotations
+        #       ├── train-semi-segmentation/  # segmentation masks for train-semi
+        #       ├── validation/         # validation images  
+        #       ├── validation-segmentation/  # segmentation masks for validation
+        #       └── ...
         
-        # Use ImageNetS919 (full dataset) for maximum classes
+        # Use ImageNetS919 dataset
+        imagenet_s_dir = root_dir
+        
         if split == 'train':
-            self.image_dir = os.path.join(root_dir, 'ImageNetS919', 'train-semi')
-            self.mask_dir = os.path.join(root_dir, 'ImageNetS919', 'train-semi')
+            self.image_dir = os.path.join(imagenet_s_dir, 'train-semi')
+            self.mask_dir = os.path.join(imagenet_s_dir, 'train-semi-segmentation')
         else:
-            self.image_dir = os.path.join(root_dir, 'ImageNetS919', 'validation')
-            self.mask_dir = os.path.join(root_dir, 'ImageNetS919', 'validation')
+            self.image_dir = os.path.join(imagenet_s_dir, 'validation')
+            self.mask_dir = os.path.join(imagenet_s_dir, 'validation-segmentation')
+        
+        # Verify directories exist
+        if not os.path.exists(self.image_dir):
+            raise ValueError(f"Image directory not found: {self.image_dir}")
+        if not os.path.exists(self.mask_dir):
+            raise ValueError(f"Mask directory not found: {self.mask_dir}")
         
         # Load class information
         self.class_to_idx = self._load_class_mapping()
@@ -90,6 +98,11 @@ class ImageNetSDataset(Dataset):
             class_mask_dir = os.path.join(self.mask_dir, class_name)
             
             if not os.path.isdir(class_image_dir):
+                print(f"Warning: Image directory not found for class {class_name}: {class_image_dir}")
+                continue
+                
+            if not os.path.isdir(class_mask_dir):
+                print(f"Warning: Mask directory not found for class {class_name}: {class_mask_dir}")
                 continue
                 
             # Get all images in this class
@@ -106,6 +119,8 @@ class ImageNetSDataset(Dataset):
                 # Only include samples that have both image and mask
                 if os.path.exists(mask_path):
                     samples.append((img_path, mask_path, class_idx))
+                else:
+                    print(f"Warning: Mask not found for {img_path}: {mask_path}")
         
         print(f"Found {len(samples)} samples in {self.split} split")
         return samples
@@ -182,10 +197,14 @@ class ImageNetSDataset(Dataset):
             mask = self.mask_transform(mask)
         
         # Convert mask to long tensor and squeeze
-        mask = (mask * 255).long().squeeze(0)  # Remove channel dimension
-        
-        # Ensure mask values are in valid range [0, num_classes]
-        mask = torch.clamp(mask, 0, self.num_classes)
+        mask = (mask * 255).long().squeeze(0)
+    
+        # CRITICAL FIX: Convert from 1-indexed to 0-indexed classes
+        # ImageNet-S uses classes [1, 919], model expects [0, 918]
+        mask = mask - 1  # Convert from [1, 918] to [0, 917]
+    
+        # Handle any invalid values (like 0 or 255 in original mask)
+        mask = torch.clamp(mask, 0, self.num_classes - 1)  # Clamp to [0, 918]
         
         return {
             'image': image,
@@ -239,7 +258,7 @@ def create_imagenet_s_dataloaders(
     Create train and validation dataloaders for ImageNet-S.
     
     Args:
-        root_dir: Path to ImageNet-S dataset
+        root_dir: Path to ImageNet-S dataset (should contain ImageNetS919 folder)
         batch_size: Batch size
         num_workers: Number of worker processes
         resolution: Input resolution
@@ -282,21 +301,66 @@ def create_imagenet_s_dataloaders(
     
     return train_loader, val_loader
 
+
+# Example usage
+if __name__ == "__main__":
+    # Example of how to use the dataset
+    root_dir = "path/to/imagenet-s"  # This should be the path to your imagenet-s folder
+    
+    # Create datasets
+    train_dataset = ImageNetSDataset(root_dir=root_dir, split='train')
+    val_dataset = ImageNetSDataset(root_dir=root_dir, split='val')
+    
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Number of classes: {train_dataset.num_classes}")
+    
+    # Visualize a sample
+    if len(train_dataset) > 0:
+        train_dataset.visualize_sample(0)
+    
+    # Create dataloaders
+    train_loader, val_loader = create_imagenet_s_dataloaders(
+        root_dir=root_dir,
+        batch_size=8,
+        num_workers=2
+    )
+    
+    # Test loading a batch
+    for batch in train_loader:
+        print(f"Batch shapes:")
+        print(f"  Images: {batch['image'].shape}")
+        print(f"  Masks: {batch['mask'].shape}")
+        print(f"  Class IDs: {batch['class_id'].shape}")
+        break
+
 '''
 
-## Key Features of this Dataset Loader:
+## Key Fixes Made:
 
-1. **ImageNet-S Support**: Handles the ImageNetS919 dataset structure with both images and segmentation masks
+1. **Correct Directory Structure**: Updated paths to match the actual ImageNet-S structure:
+   - Training: `ImageNetS919/train-semi/` (images) and `ImageNetS919/train-semi-segmentation/` (masks)
+   - Validation: `ImageNetS919/validation/` (images) and `ImageNetS919/validation-segmentation/` (masks)
 
-2. **Expected Dataset Structure**:
-   root_dir/
-   ├── ImageNetS919/
-   │   ├── train-semi/
-   │   │   ├── class1/
-   │   │   │   ├── image1.jpg
-   │   │   │   ├── image1.png (mask)
-   │   │   │   └── ...
-   │   │   └── ...
-   │   └── validation/
-   │       └── ...
+2. **Added Directory Validation**: Check if directories exist and provide helpful error messages
+
+3. **Better Error Handling**: Added warnings when image or mask directories are missing
+
+4. **Updated Documentation**: Fixed comments to reflect the actual directory structure
+
+5. **Root Directory Clarification**: The `root_dir` parameter should point to the `imagenet-s` folder (which contains `ImageNetS919`)
+
+## Usage:
+
+```python
+# Your directory structure should be:
+# /path/to/imagenet-s/
+#   └── ImageNetS919/
+#       ├── train-semi/
+#       ├── train-semi-segmentation/
+#       ├── validation/
+#       └── validation-segmentation/
+
+dataset = ImageNetSDataset(root_dir="/path/to/imagenet-s", split="train")
+```
 '''

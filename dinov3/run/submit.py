@@ -184,7 +184,7 @@ def submit_jobs(class_to_submit, output_dir, submitit_args, name="fairvit"):
 
     executor_params = get_slurm_executor_parameters(
         nodes=submitit_args.nodes,
-        ntasks_per_node=2,
+        ntasks_per_node=4,
         num_gpus_per_node=submitit_args.ngpus,
         timeout_min=submitit_args.timeout,  # max is 60 * 72
         slurm_signal_delay_s=120,

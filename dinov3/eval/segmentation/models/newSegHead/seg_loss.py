@@ -115,71 +115,103 @@ class Mask2FormerLoss(nn.Module):
         targets: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute Mask2Former loss.
-        
-        Args:
-            outputs: Model outputs containing 'pred_logits' and 'pred_masks'
-            targets: Ground truth masks [B, H, W]
-            
-        Returns:
-            Dictionary containing individual losses and total loss
+        Compute Mask2Former loss with mask and dice loss implementation.
         """
         pred_logits = outputs['pred_logits']  # [B, num_queries, num_classes + 1]
         pred_masks = outputs['pred_masks']    # [B, num_queries, H, W]
         
         batch_size, num_queries = pred_logits.shape[:2]
         device = pred_logits.device
+        H, W = pred_masks.shape[-2:]
         
-        # Create targets for each query (simplified matching)
-        # In practice, you'd use Hungarian matching, but for simplicity:
-        # We'll create targets by finding the best matching query for each ground truth
+        # Ensure targets are valid
+        num_model_classes = pred_logits.shape[-1]
+        targets = torch.clamp(targets, 0, num_model_classes - 1)
         
         losses = {}
         total_class_loss = 0
-        total_mask_loss = 0
+        total_mask_loss = 0  
         total_dice_loss = 0
         
         for b in range(batch_size):
             gt_mask = targets[b]  # [H, W]
             
-            # Create dummy classification targets (background for most queries)
-            class_targets = torch.full(
-                (num_queries,), self.num_classes, dtype=torch.long, device=device
-            )  # Background class
+            # Get unique classes in ground truth (excluding background if 0)
+            unique_classes = torch.unique(gt_mask)
+            if len(unique_classes) > 1 and unique_classes[0] == 0:
+                unique_classes = unique_classes[1:]  # Remove background
             
-            # For simplicity, assume first query should predict the mask
-            if gt_mask.max() > 0:  # If there's a foreground object
-                class_targets[0] = gt_mask.max().long()  # Use the max class as target
-                
-                # Create binary mask for the first query
-                binary_gt = (gt_mask == gt_mask.max()).float()
-                mask_target = binary_gt.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-                mask_pred = pred_masks[b:b+1, 0:1]  # [1, 1, H, W]
-                
-                # Mask BCE loss
-                mask_loss = self.mask_bce_loss(mask_pred, mask_target)
-                total_mask_loss += mask_loss
-                
-                # Dice loss for mask
-                dice_loss = self.dice_loss(mask_pred, binary_gt.unsqueeze(0).long())
-                total_dice_loss += dice_loss
+            # Initialize classification and mask targets
+            class_targets = torch.full(
+                (num_queries,), num_model_classes - 1, dtype=torch.long, device=device
+            )  # Background class
+            mask_targets = torch.zeros((num_queries, H, W), device=device)
+            
+            # Assign ground truth segments to queries
+            num_gt_segments = min(len(unique_classes), num_queries)
+            
+            for i, class_id in enumerate(unique_classes[:num_gt_segments]):
+                if i < num_queries:
+                    # Assign class
+                    class_targets[i] = class_id.long()
+                    
+                    # Create binary mask for this class
+                    binary_mask = (gt_mask == class_id).float()
+                    mask_targets[i] = binary_mask
             
             # Classification loss
-            class_loss = F.cross_entropy(pred_logits[b], class_targets)
-            total_class_loss += class_loss
+            try:
+                class_loss = F.cross_entropy(pred_logits[b], class_targets)
+                total_class_loss += class_loss
+            except Exception as e:
+                print(f"ERROR in cross_entropy: {e}")
+                total_class_loss += torch.tensor(0.0, device=device, requires_grad=True)
+            
+            # Mask losses (BCE + Dice)
+            pred_masks_b = pred_masks[b]  # [num_queries, H, W]
+            
+            # Only compute mask losses for non-background queries
+            valid_mask_indices = (class_targets != num_model_classes - 1).nonzero(as_tuple=True)[0]
+            
+            if len(valid_mask_indices) > 0:
+                # BCE Loss for masks
+                pred_masks_valid = pred_masks_b[valid_mask_indices]  # [N, H, W]
+                mask_targets_valid = mask_targets[valid_mask_indices]  # [N, H, W]
+                
+                # Apply sigmoid to predictions for BCE loss
+                mask_bce_loss = self.mask_bce_loss(pred_masks_valid, mask_targets_valid)
+                total_mask_loss += mask_bce_loss
+                
+                # Dice Loss for masks
+                # Apply sigmoid to get probabilities
+                pred_masks_prob = torch.sigmoid(pred_masks_valid)
+                
+                # Compute dice loss for each valid mask
+                dice_loss = 0
+                for i in range(len(valid_mask_indices)):
+                    pred_flat = pred_masks_prob[i].view(-1)
+                    target_flat = mask_targets_valid[i].view(-1)
+                    
+                    intersection = (pred_flat * target_flat).sum()
+                    union = pred_flat.sum() + target_flat.sum()
+                    
+                    dice_coeff = (2.0 * intersection + self.dice_loss.smooth) / (union + self.dice_loss.smooth)
+                    dice_loss += (1.0 - dice_coeff)
+                
+                if len(valid_mask_indices) > 0:
+                    dice_loss = dice_loss / len(valid_mask_indices)
+                
+                total_dice_loss += dice_loss
         
-        # Average losses
+        # Average losses across batch
         losses['class_loss'] = total_class_loss / batch_size
         losses['mask_loss'] = total_mask_loss / batch_size if total_mask_loss > 0 else torch.tensor(0.0, device=device)
         losses['dice_loss'] = total_dice_loss / batch_size if total_dice_loss > 0 else torch.tensor(0.0, device=device)
         
-        # Total loss
-        total_loss = (
-            self.weight_class * losses['class_loss'] +
-            self.weight_mask * losses['mask_loss'] +
-            self.weight_dice * losses['dice_loss']
-        )
-        
+        # Total weighted loss
+        total_loss = (self.weight_class * losses['class_loss'] + 
+                     self.weight_mask * losses['mask_loss'] + 
+                     self.weight_dice * losses['dice_loss'])
         losses['total_loss'] = total_loss
         
         return losses

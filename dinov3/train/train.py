@@ -44,12 +44,19 @@ assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
 torch.backends.cudnn.benchmark = False  # True
 
+# Import segmentation components
+from dinov3.eval.segmentation.models import build_segmentation_decoder
+from dinov3.eval.segmentation.models.heads.mask2former_head import Mask2FormerHead
+
+# Import segmentation loss and dataset
+from dinov3.eval.segmentation.models.newSegHead.seg_loss import create_loss_function  # From provided loss functions
+from dinov3.eval.segmentation.models.newSegHead.imagenet_s_dataset import create_imagenet_s_dataloaders  # From provided dataset
 logger = logging.getLogger("dinov3")
 
 
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv3 training", add_help=add_help)
-    parser.add_argument("--config-file", default="dinov3/configs/train/vitl_gram_anchor.yaml", metavar="FILE", help="path to config file")
+    parser.add_argument("--config-file", default="dinov3/configs/train/vitl_segmentation.yaml", metavar="FILE", help="path to config file")
     parser.add_argument(
         "--no-resume",
         action="store_true",
@@ -378,8 +385,20 @@ def build_multi_resolution_data_loader_from_cfg(
         )
     return data_loader
 
+def build_segmentation_data_loader(cfg, start_iter):
+    """Build segmentation data loader for ImageNet-S dataset."""
+    print(cfg.segmentation)
+    train_loader, val_loader = create_imagenet_s_dataloaders(
+        root_dir='/mmfs1/gscratch/krishna/ardae/dinov3/ImageNet-S/Dataset/ImageNetS919',
+        batch_size=cfg.train.batch_size_per_gpu,
+        num_workers=cfg.train.num_workers,
+        resolution=cfg.crops.global_crops_size,
+    )
+    return train_loader
 
-def do_train(cfg, model, resume=False):
+
+
+def do_train(cfg, model, resume=True):
     process_subgroup = distributed.get_process_subgroup()
     ckpt_dir = Path(cfg.train.output_dir, "ckpt").expanduser()
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -418,6 +437,52 @@ def do_train(cfg, model, resume=False):
                 match = re.search(r'\d+', loaded_iter)
                 loaded_iter = int(match.group()) if match else 0
         start_iter = loaded_iter + 1
+        # ===== STEP 3: NOW add segmentation (after checkpoint loading) =====
+    if cfg.segmentation.enabled:
+        logger.info("Adding segmentation head AFTER checkpoint loading")
+        
+        # Get backbone name
+        if hasattr(cfg.student, 'arch'):
+            backbone_name = f"dinov3_{cfg.student.arch}{cfg.student.patch_size}"
+        else:
+            backbone_name = "dinov3_vitl16"
+        
+        # Build segmentation decoder
+        model.segmentation_model = build_segmentation_decoder(
+            backbone_model=model.student['backbone'],
+            backbone_name=backbone_name,
+            decoder_type="m2f",
+            hidden_dim=cfg.segmentation.hidden_dim,
+            num_classes=cfg.segmentation.num_classes,
+        ).cuda()
+        
+        # Initialize segmentation loss
+        model.segmentation_loss_fn = create_loss_function(
+            num_classes=cfg.segmentation.num_classes,
+            weight_class=cfg.segmentation.loss_weight_class,
+            weight_mask=cfg.segmentation.loss_weight_mask,
+            weight_dice=cfg.segmentation.loss_weight_dice,
+        )
+        
+        # ===== STEP 4: Rebuild optimizer with segmentation parameters =====
+        param_groups = model.get_params_groups()
+        
+        # Add segmentation parameters
+        seg_param_group = {
+            'params': model.segmentation_model.parameters(),
+            'lr': cfg.optim.lr,
+            'weight_decay': cfg.optim.weight_decay,
+            'is_last_layer': False,
+            'lr_multiplier': 1.0,
+            'wd_multiplier': 1.0,
+        }
+        param_groups.append(seg_param_group)
+        
+        # Rebuild optimizer
+        optimizer = build_optimizer(cfg, param_groups)
+        
+        logger.info(f"Segmentation model created with {sum(p.numel() for p in model.segmentation_model.parameters())} parameters")
+        logger.info("Rebuilt optimizer to include segmentation parameters")
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
     if cfg.multidistillation.enabled:
@@ -432,6 +497,11 @@ def do_train(cfg, model, resume=False):
         start_iter=start_iter,
     )
 
+        # Build segmentation data loader if enabled
+    if cfg.segmentation.enabled:
+        seg_data_loader = build_segmentation_data_loader(cfg, start_iter)
+        seg_data_iter = iter(seg_data_loader)
+
     # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
@@ -441,8 +511,8 @@ def do_train(cfg, model, resume=False):
     gc.collect()
     if distributed.is_main_process():
         import wandb
-        wandb_run = wandb.init(project="dinov3", name="Training Run continuation close to gram loss kicking in")
-        wandb_run.watch(model, log="all", log_freq=1000)
+        wandb_run = wandb.init(project="dinov3", name="Training Run starting from scratch using 4gpus and segmentation enabled")
+        wandb_run.watch(model, log="all", log_freq=10)
     # Training loop
     student = model.student
     iteration = start_iter
@@ -492,6 +562,58 @@ def do_train(cfg, model, resume=False):
         optimizer.zero_grad(set_to_none=True)
         total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
         loss_dict = metrics_dict
+
+                
+        # Add segmentation loss if enabled
+        if cfg.segmentation.enabled and iteration >= cfg.segmentation.start_iteration:
+            try:
+                seg_data = next(seg_data_iter)
+            except StopIteration:
+                seg_data_iter = iter(seg_data_loader)
+                seg_data = next(seg_data_iter)
+
+            # Move segmentation data to GPU
+            seg_images = seg_data['image'].cuda()
+            seg_masks = seg_data['mask'].cuda()
+
+            # Forward through segmentation model
+            seg_outputs = model.segmentation_model(seg_images)
+
+            # ===== FIX: UPSAMPLE PREDICTIONS TO MATCH GROUND TRUTH RESOLUTION =====
+            # Get the ground truth spatial size
+            target_size = seg_masks.shape[-2:]  # (H, W) from seg_masks
+    
+            # Upsample predicted masks to match ground truth size
+            seg_outputs["pred_masks"] = torch.nn.functional.interpolate(
+                seg_outputs["pred_masks"],
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+    
+            # Also upsample auxiliary outputs if they exist
+            if "aux_outputs" in seg_outputs:
+                for aux_output in seg_outputs["aux_outputs"]:
+                    aux_output["pred_masks"] = torch.nn.functional.interpolate(
+                        aux_output["pred_masks"],
+                        size=target_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+            # Compute segmentation loss (now sizes match!)
+            seg_loss_dict = model.segmentation_loss_fn(seg_outputs, seg_masks)
+            seg_total_loss = seg_loss_dict['total_loss'] * cfg.segmentation.loss_weight
+
+            # Add to total loss
+            total_loss = total_loss + seg_total_loss
+
+            # Add segmentation metrics
+            metrics_dict.update({
+                f"seg_{k}": v for k, v in seg_loss_dict.items()
+            })
+            metrics_dict["seg_total_weighted_loss"] = seg_total_loss
+
 
 
         # Organize losses into separate graphs using different prefixes
@@ -544,6 +666,44 @@ def do_train(cfg, model, resume=False):
 
         if "stats_only/unmasked_gram_loss" in loss_dict:
             wandb_log_dict["gram_stats/unmasked_loss"] = loss_dict["stats_only/unmasked_gram_loss"].item() if hasattr(loss_dict["stats_only/unmasked_gram_loss"], 'item') else loss_dict["stats_only/unmasked_gram_loss"]
+
+        # Segmentation Loss Graph (if enabled)
+        if cfg.segmentation.enabled:
+            # Total segmentation loss
+            seg_total_loss_val = seg_loss_dict["total_loss"].item() if hasattr(seg_loss_dict["total_loss"], 'item') else seg_loss_dict["total_loss"]
+            wandb_log_dict["segmentation/total_loss"] = seg_total_loss_val
+            wandb_log_dict["segmentation/total_weighted_loss"] = seg_total_loss_val * cfg.segmentation.loss_weight
+    
+            # Classification loss component
+            if "class_loss" in seg_loss_dict:
+                class_loss_val = seg_loss_dict["class_loss"].item() if hasattr(seg_loss_dict["class_loss"], 'item') else seg_loss_dict["class_loss"]
+                wandb_log_dict["segmentation/class_loss"] = class_loss_val
+                wandb_log_dict["segmentation/class_weighted_loss"] = class_loss_val * cfg.segmentation.get('weight_class', 2.0)
+    
+            # Mask BCE loss component  
+            if "mask_loss" in seg_loss_dict:
+                mask_loss_val = seg_loss_dict["mask_loss"].item() if hasattr(seg_loss_dict["mask_loss"], 'item') else seg_loss_dict["mask_loss"]
+                wandb_log_dict["segmentation/mask_loss"] = mask_loss_val
+                wandb_log_dict["segmentation/mask_weighted_loss"] = mask_loss_val * cfg.segmentation.get('weight_mask', 5.0)
+    
+            # Dice loss component
+            if "dice_loss" in seg_loss_dict:
+                dice_loss_val = seg_loss_dict["dice_loss"].item() if hasattr(seg_loss_dict["dice_loss"], 'item') else seg_loss_dict["dice_loss"]
+                wandb_log_dict["segmentation/dice_loss"] = dice_loss_val  
+                wandb_log_dict["segmentation/dice_weighted_loss"] = dice_loss_val * cfg.segmentation.get('weight_dice', 5.0)
+    
+            # Overall segmentation weight
+            wandb_log_dict["segmentation/overall_weight"] = cfg.segmentation.loss_weight
+    
+            # Loss ratios for analysis
+            if seg_total_loss_val > 0:
+                if "class_loss" in seg_loss_dict:
+                    wandb_log_dict["segmentation/class_loss_ratio"] = (seg_loss_dict["class_loss"].item() if hasattr(seg_loss_dict["class_loss"], 'item') else seg_loss_dict["class_loss"]) / seg_total_loss_val
+                if "mask_loss" in seg_loss_dict:
+                    wandb_log_dict["segmentation/mask_loss_ratio"] = (seg_loss_dict["mask_loss"].item() if hasattr(seg_loss_dict["mask_loss"], 'item') else seg_loss_dict["mask_loss"]) / seg_total_loss_val
+                if "dice_loss" in seg_loss_dict:
+                    wandb_log_dict["segmentation/dice_loss_ratio"] = (seg_loss_dict["dice_loss"].item() if hasattr(seg_loss_dict["dice_loss"], 'item') else seg_loss_dict["dice_loss"]) / seg_total_loss_val
+
             
 
         # Log to wandb
