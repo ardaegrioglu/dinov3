@@ -16,6 +16,7 @@ BACKBONE_INTERMEDIATE_LAYERS = {
     "dinov3_vitb16": [2, 5, 8, 11],
     "dinov3_vitl16": [4, 11, 17, 23],
     "dinov3_vit7b16": [9, 19, 29, 39],
+    "dinov3_vit_large16": [4, 11, 17, 23],
 }
 
 

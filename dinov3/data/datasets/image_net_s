@@ -1,0 +1,217 @@
+# dinov3/data/datasets/image_net_s.py
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This software may be used and distributed in accordance with
+# the terms of the DINOv3 License Agreement.
+
+import os
+from enum import Enum
+from typing import Any, Callable, List, Optional, Tuple, Union
+
+from PIL import Image
+import numpy as np
+
+from .decoders import Decoder, DenseTargetDecoder, ImageDataDecoder
+from .extended import ExtendedVisionDataset
+
+
+class _Split(Enum):
+    TRAIN_SEMI = "train-semi"      # 10 images per class with pixel annotations
+    TRAIN = "train"                # Full ImageNet-S-919 training set  
+    TRAIN_FULL = "train-full"      # Full ImageNet-1k training set
+    VAL = "validation"             # ImageNet-S-919 validation set
+    TEST = "test"                  # ImageNet-S-919 test set (no masks available)
+
+    @property
+    def has_masks(self) -> bool:
+        """Check if this split has segmentation masks available."""
+        return self in (_Split.TRAIN_SEMI, _Split.VAL)
+
+
+def _load_file_paths(root: str, split: _Split) -> Tuple[List[str], List[str]]:
+    """Load ImageNet-S file paths for images and segmentation masks."""
+    
+    # ImageNet-S actual structure:
+    # root/
+    #   imagenet-s/
+    #     ImageNetS919/
+    #       train-full/          # full imagenet-1k training set with 1000 classes
+    #       train/               # imagenet-s-919 training set with 919 classes  
+    #       train-semi/          # imagenet-s-919 training images with pixel annotations (10 per class)
+    #       train-semi-segmentation/  # semantic segmentation masks for train-semi
+    #       validation/          # imagenet-s-919 validation set
+    #       validation-segmentation/  # semantic segmentation masks for validation
+    #       test/                # imagenet-s-919 test set (no masks)
+    
+    imagenet_s_root = os.path.join(root, "imagenet-s", "ImageNetS919")
+    
+    # Image directory based on split
+    image_dir = os.path.join(imagenet_s_root, split.value)
+    
+    # Segmentation directory (only for splits that have masks)
+    if split == _Split.TRAIN_SEMI:
+        segm_dir = os.path.join(imagenet_s_root, "train-semi-segmentation")
+    elif split == _Split.VAL:
+        segm_dir = os.path.join(imagenet_s_root, "validation-segmentation")
+    else:
+        segm_dir = None
+    
+    image_paths = []
+    segm_paths = []
+    
+    if split in (_Split.TRAIN_SEMI, _Split.TRAIN, _Split.TRAIN_FULL):
+        # Training splits: organized by class folders
+        for class_folder in sorted(os.listdir(image_dir)):
+            class_dir = os.path.join(image_dir, class_folder)
+            if not os.path.isdir(class_dir):
+                continue
+                
+            for img_file in sorted(os.listdir(class_dir)):
+                if not img_file.lower().endswith(('.jpg', '.jpeg')):
+                    continue
+                    
+                # Relative path from root
+                img_path = os.path.join("imagenet-s", "ImageNetS919", split.value, class_folder, img_file)
+                image_paths.append(img_path)
+                
+                # Add segmentation mask if available
+                if split.has_masks and segm_dir is not None:
+                    mask_file = img_file.replace('.JPEG', '.png').replace('.jpg', '.png')
+                    mask_path = os.path.join("imagenet-s", "ImageNetS919", 
+                                           "train-semi-segmentation" if split == _Split.TRAIN_SEMI else "validation-segmentation",
+                                           class_folder, mask_file)
+                    
+                    # Check if segmentation mask exists
+                    mask_full_path = os.path.join(root, mask_path)
+                    if os.path.exists(mask_full_path):
+                        segm_paths.append(mask_path)
+                    else:
+                        # Remove the image if no corresponding mask exists
+                        image_paths.pop()
+    
+    elif split == _Split.VAL:
+        # Validation: flat structure
+        for img_file in sorted(os.listdir(image_dir)):
+            if not img_file.lower().endswith(('.jpg', '.jpeg')):
+                continue
+                
+            img_path = os.path.join("imagenet-s", "ImageNetS919", "validation", img_file)
+            image_paths.append(img_path)
+            
+            # Add corresponding segmentation mask
+            mask_file = img_file.replace('.JPEG', '.png').replace('.jpg', '.png')
+            mask_path = os.path.join("imagenet-s", "ImageNetS919", "validation-segmentation", mask_file)
+            
+            # Check if segmentation mask exists
+            mask_full_path = os.path.join(root, mask_path)
+            if os.path.exists(mask_full_path):
+                segm_paths.append(mask_path)
+            else:
+                # Remove the image if no corresponding mask exists
+                image_paths.pop()
+    
+    elif split == _Split.TEST:
+        # Test: flat structure, no masks available
+        for img_file in sorted(os.listdir(image_dir)):
+            if not img_file.lower().endswith(('.jpg', '.jpeg')):
+                continue
+                
+            img_path = os.path.join("imagenet-s", "ImageNetS919", "test", img_file)
+            image_paths.append(img_path)
+    
+    return image_paths, segm_paths
+
+
+class ImageNetS(ExtendedVisionDataset):
+    """
+    ImageNet-S dataset for semantic segmentation.
+    
+    ImageNet-S is a large-scale dataset for semantic segmentation that provides 
+    pixel-level annotations for ImageNet images. It contains multiple splits:
+    
+    - train-semi: 10 images per class with pixel-level annotations (919 classes)
+    - train: Full ImageNet-S-919 training set without pixel annotations
+    - train-full: Full ImageNet-1k training set (1000 classes) without annotations
+    - validation: ImageNet-S-919 validation set with pixel-level annotations
+    - test: ImageNet-S-919 test set (annotations on evaluation server)
+    
+    Args:
+        split: Dataset split ('train-semi', 'train', 'train-full', 'validation', 'test')
+        root: Root directory containing imagenet-s folder
+        transforms: A function/transform that takes input sample and returns a transformed version
+        transform: A function/transform that takes in a PIL image and returns a transformed version
+        target_transform: A function/transform that takes in the target and transforms it
+        image_decoder: Decoder for image data
+        target_decoder: Decoder for segmentation mask data
+    """
+    
+    Split = Union[_Split]
+    Labels = Union[Image.Image]
+
+    def __init__(
+        self,
+        split: "ImageNetS.Split",
+        root: Optional[str] = None,
+        transforms: Optional[Callable] = None,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        image_decoder: Decoder = ImageDataDecoder,
+        target_decoder: Decoder = DenseTargetDecoder,
+    ) -> None:
+        super().__init__(
+            root=root,
+            transforms=transforms,
+            transform=transform,
+            target_transform=target_transform,
+            image_decoder=image_decoder,
+            target_decoder=target_decoder,
+        )
+
+        self.split = split
+        self.image_paths, self.target_paths = _load_file_paths(root, split)
+        
+        if split.has_masks:
+            print(f"Loaded {len(self.image_paths)} ImageNet-S {split.value} samples with segmentation masks")
+        else:
+            print(f"Loaded {len(self.image_paths)} ImageNet-S {split.value} samples (no segmentation masks)")
+
+    def get_image_data(self, index: int) -> bytes:
+        """Load image data as bytes."""
+        image_relpath = self.image_paths[index]
+        image_full_path = os.path.join(self.root, image_relpath)
+        with open(image_full_path, mode="rb") as f:
+            image_data = f.read()
+        return image_data
+
+    def get_target(self, index: int) -> Any:
+        """Load segmentation mask data as bytes."""
+        if not self.split.has_masks:
+            raise ValueError(f"Split {self.split.value} does not have segmentation masks")
+            
+        target_relpath = self.target_paths[index]
+        target_full_path = os.path.join(self.root, target_relpath)
+        with open(target_full_path, mode="rb") as f:
+            target_data = f.read()
+        return target_data
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def get_class_name(self, index: int) -> str:
+        """Get class name from image path."""
+        if self.split in (_Split.TRAIN_SEMI, _Split.TRAIN, _Split.TRAIN_FULL):
+            # Extract class name from path: imagenet-s/ImageNetS919/train/n01440764/image.JPEG
+            path_parts = self.image_paths[index].split('/')
+            class_id = path_parts[-2]  # Second to last part is class folder
+            return class_id
+        else:
+            # For validation and test, you might need to load a separate mapping file
+            # This is a simplified version - you may need to adapt based on your setup
+            return "unknown"
+
+    def get_num_classes(self) -> int:
+        """Get number of classes for this split."""
+        if self.split == _Split.TRAIN_FULL:
+            return 1000  # Full ImageNet-1k
+        else:
+            return 919   # ImageNet-S-919

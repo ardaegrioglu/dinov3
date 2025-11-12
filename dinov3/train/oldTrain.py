@@ -56,7 +56,7 @@ logger = logging.getLogger("dinov3")
 
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv3 training", add_help=add_help)
-    parser.add_argument("--config-file", default="dinov3/configs/train/vitl_segmentation.yaml", metavar="FILE", help="path to config file")
+    parser.add_argument("--config-file", default="dinov3/configs/train/vitl_gram_anchor.yaml", metavar="FILE", help="path to config file")
     parser.add_argument(
         "--no-resume",
         action="store_true",
@@ -228,24 +228,7 @@ def build_schedulers_v2(cfg):
             else None
         ),
     )
-    
-    # ===== ADD SEGMENTATION LOSS WEIGHT SCHEDULE =====
-    seg_loss_weight_schedule = None
-    if cfg.segmentation.enabled and cfg.segmentation.get("loss_weight_schedule"):
-        schedule_cfg = cfg.segmentation.loss_weight_schedule
-        seg_loss_weight_schedule = linear_warmup_cosine_decay(
-            start=schedule_cfg.start,
-            peak=schedule_cfg.peak,
-            end=schedule_cfg.end,
-            warmup_iterations=iter_per_epoch * schedule_cfg.warmup_epochs,
-            total_iterations=total_iterations,
-            cosine_iterations=(
-                iter_per_epoch * schedule_cfg.cosine_epochs if "cosine_epochs" in schedule_cfg else None
-            ),
-        )
-        logger.info(f"Created segmentation loss weight schedule: start={schedule_cfg.start}, peak={schedule_cfg.peak}, end={schedule_cfg.end}")
-    
-    return lr, weight_decay, momentum, teacher_temp, last_layer_lr, seg_loss_weight_schedule
+    return lr, weight_decay, momentum, teacher_temp, last_layer_lr
 
 
 def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
@@ -421,39 +404,26 @@ def do_train(cfg, model, resume=True):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     model.train()
-    
-    # Initialize model weights BEFORE creating optimizer so optimizer param_groups
-    # reference actual tensors (not meta placeholders)
-    model.init_weights()
-    
-    # Build base optimizer WITHOUT segmentation
-    param_groups = model.get_params_groups()
-    optimizer = build_optimizer(cfg, param_groups)
-    
-    logger.info(f"Total parameter groups: {len(optimizer.param_groups)}")
-    
-    # Build schedules
+    # Optimizer
+    optimizer = build_optimizer(cfg, model.get_params_groups())
     (
         lr_schedule,
         wd_schedule,
         momentum_schedule,
         teacher_temp_schedule,
         last_layer_lr_schedule,
-        seg_loss_weight_schedule
     ) = build_schedulers(cfg)
-    
     if cfg.multidistillation.enabled:
         register_dont_save_hooks(
             model,
             dont_save=[k for k, _ in model.state_dict().items() if k.startswith("teacher")],
         )
-    
-    # Load checkpoint FIRST (base model only)
+    model.init_weights()
     start_iter = 0
     if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
-        try:
-            loaded_iter = load_checkpoint(
+        loaded_iter = (
+            load_checkpoint(
                 last_checkpoint_dir,
                 model=model,
                 optimizer=optimizer,
@@ -461,21 +431,13 @@ def do_train(cfg, model, resume=True):
                 process_group=process_subgroup,
             )
             
-            # Handle both int and string returns
-            if isinstance(loaded_iter, str):
+        )
+        if(isinstance(loaded_iter, str)):
                 import re
                 match = re.search(r'\d+', loaded_iter)
                 loaded_iter = int(match.group()) if match else 0
-                
-            start_iter = loaded_iter + 1
-            logger.info(f"Resumed from iteration {start_iter}")
-            
-        except Exception as e:
-            logger.warning(f"Failed to load checkpoint: {e}")
-            logger.info("Starting training from scratch")
-            start_iter = 0
-
-    # Add segmentation model AFTER checkpoint loading
+        start_iter = loaded_iter + 1
+        # ===== STEP 3: NOW add segmentation (after checkpoint loading) =====
     if cfg.segmentation.enabled:
         logger.info("Adding segmentation head AFTER checkpoint loading")
         
@@ -502,80 +464,59 @@ def do_train(cfg, model, resume=True):
             weight_dice=cfg.segmentation.loss_weight_dice,
         )
         
-        # Only add NEW decoder parameters
-        existing_param_ids = set(id(param) for group in optimizer.param_groups for param in group['params'])
-
-        # Filter out backbone parameters that are already in the optimizer
-        new_seg_params = []
-        for param in model.segmentation_model.parameters():
-            if id(param) not in existing_param_ids:
-                new_seg_params.append(param)
-
-        logger.info(f"Adding {len(new_seg_params)} new segmentation parameters to optimizer")
-        logger.info(f"Skipping {sum(p.numel() for p in model.segmentation_model.parameters()) - sum(p.numel() for p in new_seg_params)} shared backbone parameters")
-
-        if new_seg_params:  # Only add if there are new parameters
-            seg_param_group = {
-                'params': new_seg_params,
-                'lr': cfg.optim.lr,
-                'weight_decay': cfg.optim.weight_decay,
-                'is_last_layer': False,
-                'lr_multiplier': 0.1,  # Slower LR for segmentation
-                'wd_multiplier': 1.0,
-            }
-            optimizer.add_param_group(seg_param_group)
-        else:
-            logger.warning("No new segmentation parameters found - all parameters already in optimizer")
+        # ===== STEP 4: Rebuild optimizer with segmentation parameters =====
+        param_groups = model.get_params_groups()
         
-            logger.info(f"Segmentation model created with {sum(p.numel() for p in model.segmentation_model.parameters())} parameters")
-
-    # Setup training variables
+        # Add segmentation parameters
+        seg_param_group = {
+            'params': model.segmentation_model.parameters(),
+            'lr': cfg.optim.lr,
+            'weight_decay': cfg.optim.weight_decay,
+            'is_last_layer': False,
+            'lr_multiplier': 1.0,
+            'wd_multiplier': 1.0,
+        }
+        param_groups.append(seg_param_group)
+        
+        # Rebuild optimizer
+        optimizer = build_optimizer(cfg, param_groups)
+        
+        logger.info(f"Segmentation model created with {sum(p.numel() for p in model.segmentation_model.parameters())} parameters")
+        logger.info("Rebuilt optimizer to include segmentation parameters")
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
-    
     if cfg.multidistillation.enabled:
         global_batch_size = cfg.multidistillation.global_batch_size
     else:
         global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size()
 
-    # Build main data loader
+    # Build data loader
     data_loader = build_multi_resolution_data_loader_from_cfg(
         cfg=cfg,
         model=model,
         start_iter=start_iter,
     )
 
-    # Build segmentation data loader
-    seg_data_loader = None
-    seg_data_iter = None
+        # Build segmentation data loader if enabled
     if cfg.segmentation.enabled:
-        logger.info("Building segmentation data loader")
         seg_data_loader = build_segmentation_data_loader(cfg, start_iter)
         seg_data_iter = iter(seg_data_loader)
 
-    # Setup logging
+    # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
-    
     # Manual garbage collection
     gc.disable()
     gc.collect()
-    
-    # Setup WandB
     if distributed.is_main_process():
         import wandb
-        wandb_run = wandb.init(
-            project="dinov3", 
-            name=f"Training Run starting from iteration {start_iter} with segmentation {'enabled' if cfg.segmentation.enabled else 'disabled'} fixed segmentation bug in training"
-        )
-        wandb_run.watch(model, log="all", log_freq=10)
-
+        wandb_run = wandb.init(project="dinov3", name="Training Run continuation close to gram loss kicking in")
+        wandb_run.watch(model, log="all", log_freq=1000)
     # Training loop
     student = model.student
     iteration = start_iter
     num_gram_updates = 0
-    
     if (
         cfg.gram.use_loss
         and model.has_gram_teacher
@@ -583,11 +524,11 @@ def do_train(cfg, model, resume=True):
         and start_iter > 0
         and start_iter >= cfg.gram.it_first_update
     ):
+        # If `start_iter == it_first_update`, we have performed one gram teacher update after
+        # iteration `start_iter - 1`, except if we are starting training from scratch and `start_iter == 0`.
         num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
         logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
-    
     consecutive_nan_count = 0
-    
     for data in metric_logger.log_every(
         data_loader,
         print_freq=10,
@@ -597,11 +538,10 @@ def do_train(cfg, model, resume=True):
     ):
         it = iteration
         data["global_batch_size"] = global_batch_size
-        
         if iteration > max_iter:
             return
 
-        # Garbage collection
+        # Garbage collection (trigger manually so it happens on all ranks at the same time)
         if (iteration + 1) % 150 == 0:
             logger.info("Garbage collection")
             gc.collect()
@@ -610,7 +550,7 @@ def do_train(cfg, model, resume=True):
             logger.info(f"Loading EMA teacher into Gram teacher before iteration {it}")
             model.gram_load_ema_teacher()
 
-        # Learning rates and schedules
+        # Learning rates and other schedules
         lr = lr_schedule[it]
         wd = wd_schedule[it]
         mom = momentum_schedule[it]
@@ -618,29 +558,17 @@ def do_train(cfg, model, resume=True):
         last_layer_lr = last_layer_lr_schedule[it]
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
-        # Debug learning rates every 50 iterations
-        if iteration % 50 == 0:
-            logger.info(f"=== Iteration {iteration} Learning Rates ===")
-            for i, pg in enumerate(optimizer.param_groups):
-                lr_val = pg['lr']
-                wd_val = pg['weight_decay']
-                logger.info(f"  Group {i}: LR={lr_val:.2e}, WD={wd_val:.2e}")
-
         # Forward backward
         optimizer.zero_grad(set_to_none=True)
         total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
-        loss_dict = metrics_dict.copy()  # Create a copy for safety
+        loss_dict = metrics_dict
 
-        # Store original DINO loss for monitoring
-        dino_loss = total_loss.clone().detach()
-        metrics_dict["dino_only_loss"] = dino_loss
-
-        # Add segmentation loss
+                
+        # Add segmentation loss if enabled
         if cfg.segmentation.enabled and iteration >= cfg.segmentation.start_iteration:
             try:
                 seg_data = next(seg_data_iter)
             except StopIteration:
-                logger.info("Segmentation data iterator exhausted, creating new iterator")
                 seg_data_iter = iter(seg_data_loader)
                 seg_data = next(seg_data_iter)
 
@@ -649,132 +577,100 @@ def do_train(cfg, model, resume=True):
             seg_masks = seg_data['mask'].cuda()
 
             # Forward through segmentation model
-            with torch.cuda.amp.autocast(enabled=cfg.compute_precision.param_dtype != 'fp32'):
-                seg_outputs = model.segmentation_model(seg_images)
+            seg_outputs = model.segmentation_model(seg_images)
 
-                # Upsample predictions to match ground truth resolution
-                target_size = seg_masks.shape[-2:]  # (H, W) from seg_masks
-        
-                seg_outputs["pred_masks"] = torch.nn.functional.interpolate(
-                    seg_outputs["pred_masks"],
-                    size=target_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-        
-                # Also upsample auxiliary outputs if they exist
-                if "aux_outputs" in seg_outputs:
-                    for aux_output in seg_outputs["aux_outputs"]:
-                        aux_output["pred_masks"] = torch.nn.functional.interpolate(
-                            aux_output["pred_masks"],
-                            size=target_size,
-                            mode="bilinear",
-                            align_corners=False,
-                        )
+            # ===== FIX: UPSAMPLE PREDICTIONS TO MATCH GROUND TRUTH RESOLUTION =====
+            # Get the ground truth spatial size
+            target_size = seg_masks.shape[-2:]  # (H, W) from seg_masks
+    
+            # Upsample predicted masks to match ground truth size
+            seg_outputs["pred_masks"] = torch.nn.functional.interpolate(
+                seg_outputs["pred_masks"],
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+    
+            # Also upsample auxiliary outputs if they exist
+            if "aux_outputs" in seg_outputs:
+                for aux_output in seg_outputs["aux_outputs"]:
+                    aux_output["pred_masks"] = torch.nn.functional.interpolate(
+                        aux_output["pred_masks"],
+                        size=target_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
 
-                # Compute segmentation loss
-                seg_loss_dict = model.segmentation_loss_fn(seg_outputs, seg_masks)
-                if seg_loss_weight_schedule is not None:
-                    seg_loss_weight = seg_loss_weight_schedule[iteration]
-                else:
-                    seg_loss_weight = cfg.segmentation.loss_weight
-                seg_total_loss = seg_loss_dict['total_loss'] * seg_loss_weight
-                metrics_dict["seg_loss_weight"] = seg_loss_weight
+            # Compute segmentation loss (now sizes match!)
+            seg_loss_dict = model.segmentation_loss_fn(seg_outputs, seg_masks)
+            seg_total_loss = seg_loss_dict['total_loss'] * cfg.segmentation.loss_weight
 
             # Add to total loss
             total_loss = total_loss + seg_total_loss
 
             # Add segmentation metrics
-            for k, v in seg_loss_dict.items():
-                metrics_dict[f"seg_{k}"] = v
+            metrics_dict.update({
+                f"seg_{k}": v for k, v in seg_loss_dict.items()
+            })
             metrics_dict["seg_total_weighted_loss"] = seg_total_loss
 
-        # Monitor loss components every 10 iterations
-        if iteration % 10 == 0:
-            loss_components = []
-            
-            # DINO loss components
-            if "dino_local_crops_loss" in metrics_dict:
-                dino_loss_val = metrics_dict["dino_local_crops_loss"].item() if torch.is_tensor(metrics_dict["dino_local_crops_loss"]) else metrics_dict["dino_local_crops_loss"]
-                loss_components.append(f"DINO={dino_loss_val:.6f}")
-            
-            if "ibot_loss" in metrics_dict:
-                ibot_loss_val = metrics_dict["ibot_loss"].item() if torch.is_tensor(metrics_dict["ibot_loss"]) else metrics_dict["ibot_loss"]
-                loss_components.append(f"iBOT={ibot_loss_val:.6f}")
-            
-            if "koleo_loss" in metrics_dict:
-                koleo_loss_val = metrics_dict["koleo_loss"].item() if torch.is_tensor(metrics_dict["koleo_loss"]) else metrics_dict["koleo_loss"]
-                loss_components.append(f"KoLeo={koleo_loss_val:.6f}")
-            
-            # Segmentation loss components
-            if cfg.segmentation.enabled and iteration >= cfg.segmentation.start_iteration:
-                if "seg_total_loss" in metrics_dict:
-                    seg_loss_val = metrics_dict["seg_total_loss"].item() if torch.is_tensor(metrics_dict["seg_total_loss"]) else metrics_dict["seg_total_loss"]
-                    if "seg_loss_weight" in metrics_dict:
-                        seg_weight = metrics_dict["seg_loss_weight"].item() if torch.is_tensor(metrics_dict["seg_loss_weight"]) else metrics_dict["seg_loss_weight"]
-                        seg_weighted = seg_loss_val * seg_weight
-                        loss_components.append(f"Seg={seg_loss_val:.6f}*{seg_weight:.3f}={seg_weighted:.6f}")
-            
-            total_loss_val = total_loss.item() if torch.is_tensor(total_loss) else total_loss
-            logger.info(f"Iter {iteration}: Total={total_loss_val:.6f} | " + " | ".join(loss_components))
 
-        # Safe WandB logging
+
+        # Organize losses into separate graphs using different prefixes
         wandb_log_dict = {}
-
-        def safe_get_value(tensor_or_value):
-            """Safely extract scalar value from tensor or return value as-is"""
-            if hasattr(tensor_or_value, 'item'):
-                return tensor_or_value.item()
-            elif torch.is_tensor(tensor_or_value):
-                return tensor_or_value.detach().cpu().item()
-            else:
-                return float(tensor_or_value)
 
         # DINO Loss Graph
         if "dino_local_crops_loss" in loss_dict:
-            dino_loss_val = safe_get_value(loss_dict["dino_local_crops_loss"])
+            dino_loss_val = loss_dict["dino_local_crops_loss"].item() if hasattr(loss_dict["dino_local_crops_loss"], 'item') else loss_dict["dino_loss"]
             wandb_log_dict["dino/loss"] = dino_loss_val
-        elif "dino_loss" in loss_dict:
-            dino_loss_val = safe_get_value(loss_dict["dino_loss"])
-            wandb_log_dict["dino/loss"] = dino_loss_val
+            # Add weight and weighted loss if you have access to model weights
+            try:
+                wandb_log_dict["dino/dino_local_loss_weight"] = loss_dict["dino_local_loss_weight"]
+                wandb_log_dict["dino/weighted_loss"] = loss_dict["dino_local_loss_weight"] * dino_loss_val
+            except AttributeError:
+                pass
 
         # KoLeo Loss Graph  
         if "koleo_loss" in loss_dict:
-            koleo_loss_val = safe_get_value(loss_dict["koleo_loss"])
+            koleo_loss_val = loss_dict["koleo_loss"].item() if hasattr(loss_dict["koleo_loss"], 'item') else loss_dict["koleo_loss"]
             wandb_log_dict["koleo/loss"] = koleo_loss_val
+            try:
+                wandb_log_dict["koleo/weight"] = model.koleo_loss_weight
+                wandb_log_dict["koleo/weighted_loss"] = model.koleo_loss_weight * koleo_loss_val
+            except AttributeError:
+                pass
 
         # iBOT Loss Graph
         if "ibot_loss" in loss_dict:
-            ibot_loss_val = safe_get_value(loss_dict["ibot_loss"])
+            ibot_loss_val = loss_dict["ibot_loss"].item() if hasattr(loss_dict["ibot_loss"], 'item') else loss_dict["ibot_loss"]
             wandb_log_dict["ibot/loss"] = ibot_loss_val
+            try:
+                wandb_log_dict["ibot/weight"] = model.ibot_loss_weight
+                wandb_log_dict["ibot/weighted_loss"] = model.ibot_loss_weight * ibot_loss_val
+            except AttributeError:
+                pass
 
-        # Gram Loss Graph
+        # Gram Loss Graph (if enabled)
         if "gram_loss" in loss_dict:
-            gram_loss_val = safe_get_value(loss_dict["gram_loss"])
+            gram_loss_val = loss_dict["gram_loss"].item() if hasattr(loss_dict["gram_loss"], 'item') else loss_dict["gram_loss"]
             wandb_log_dict["gram/loss"] = gram_loss_val
+    
+            if "gram_loss_weight" in loss_dict:
+                gram_weight = loss_dict["gram_loss_weight"]
+                wandb_log_dict["gram/weight"] = gram_weight
+                wandb_log_dict["gram/weighted_loss"] = gram_loss_val * gram_weight
 
-        # Segmentation Loss Graph
-        if cfg.segmentation.enabled and iteration >= cfg.segmentation.start_iteration:
-            seg_total_loss_val = safe_get_value(seg_loss_dict["total_loss"])
-            wandb_log_dict["segmentation/total_loss"] = seg_total_loss_val
-            if "seg_loss_weight" in metrics_dict:
-                wandb_log_dict["segmentation/scheduled_weight"] = safe_get_value(metrics_dict["seg_loss_weight"])
-                scheduled_weight = safe_get_value(metrics_dict["seg_loss_weight"])
-                wandb_log_dict["segmentation/total_weighted_loss"] = seg_total_loss_val * scheduled_weight
-            else:
-                wandb_log_dict["segmentation/total_weighted_loss"] = seg_total_loss_val * cfg.segmentation.loss_weight
+        # Gram Stats Graph (if enabled)
+        if "stats_only/masked_gram_loss" in loss_dict:
+            wandb_log_dict["gram_stats/masked_loss"] = loss_dict["stats_only/masked_gram_loss"].item() if hasattr(loss_dict["stats_only/masked_gram_loss"], 'item') else loss_dict["stats_only/masked_gram_loss"]
+
+        if "stats_only/unmasked_gram_loss" in loss_dict:
+            wandb_log_dict["gram_stats/unmasked_loss"] = loss_dict["stats_only/unmasked_gram_loss"].item() if hasattr(loss_dict["stats_only/unmasked_gram_loss"], 'item') else loss_dict["stats_only/unmasked_gram_loss"]
             
-            if "class_loss" in seg_loss_dict:
-                wandb_log_dict["segmentation/class_loss"] = safe_get_value(seg_loss_dict["class_loss"])
-            if "mask_loss" in seg_loss_dict:
-                wandb_log_dict["segmentation/mask_loss"] = safe_get_value(seg_loss_dict["mask_loss"])
-            if "dice_loss" in seg_loss_dict:
-                wandb_log_dict["segmentation/dice_loss"] = safe_get_value(seg_loss_dict["dice_loss"])
 
         # Log to wandb
-        if distributed.is_main_process() and wandb_log_dict:
+        if distributed.is_main_process():
             wandb_run.log(wandb_log_dict, step=iteration)
-
         # Gradient clipping
         if cfg.optim.clip_grad:
             for k, v in student.items():
@@ -788,7 +684,7 @@ def do_train(cfg, model, resume=True):
                     else grad_norm.item()
                 )
 
-        # Check for NaNs and reduce metrics
+        # Reduce total_loss to check for NaNs, reduce metrics for logging
         total_loss_all_ranks = total_loss.new_empty(distributed.get_subgroup_size())
         torch.distributed.all_gather_into_tensor(
             total_loss_all_ranks,
@@ -796,26 +692,33 @@ def do_train(cfg, model, resume=True):
             group=distributed.get_process_subgroup(),
         )
         total_loss = total_loss_all_ranks.mean()
-        
-        # Handle NaN detection
+        metrics_values = torch.stack(
+            [torch.as_tensor(v, dtype=torch.float32, device=total_loss.device).detach() for v in metrics_dict.values()]
+        )
+        torch.distributed.all_reduce(
+            metrics_values,
+            op=torch.distributed.ReduceOp.AVG,
+            group=distributed.get_process_subgroup(),
+        )
+        metrics_dict = dict(zip(metrics_dict.keys(), metrics_values))
         if total_loss_all_ranks.isnan().any():
             consecutive_nan_count += 1
             which_ranks = total_loss_all_ranks.isnan().nonzero().flatten().tolist()
             logger.warning("NaN loss detected on ranks: %s", which_ranks)
             logger.warning("Consecutive NaNs: %d", consecutive_nan_count)
-            
+            metrics_dict_str = "\n".join([f"{k}: {v}" for k, v in metrics_dict.items()])
+            logger.warning("All-reduced metrics:\n%s", metrics_dict_str)
             if consecutive_nan_count > 2 and not cfg.multidistillation.enabled:
                 msg = "Too many consecutive nans detected in loss, aborting..."
                 logger.error(msg)
                 raise RuntimeError(msg)
         else:
             consecutive_nan_count = 0
-
         # Step optimizer
         optimizer.step()
         model.update_ema(mom)
 
-        # Update gram teacher if needed
+        # [GRAM] Update gram teacher when using gram teacher and frequent updates
         if (
             cfg.gram.use_loss
             and model.gram_rep_update
@@ -833,20 +736,12 @@ def do_train(cfg, model, resume=True):
         metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(total_loss=total_loss, **metrics_dict)
-        
         if distributed.is_main_process():
-            wandb_run.log({
-                "lr": lr, 
-                "wd": wd, 
-                "mom": mom, 
-                "last_layer_lr": last_layer_lr, 
-                "total_loss": safe_get_value(total_loss)
-            }, step=iteration)
-
+            wandb_run.log({"lr": lr, "wd": wd, "mom": mom, "last_layer_lr":last_layer_lr, "total_loss":total_loss})
         # Submit evaluation jobs
         if (
-            cfg.evaluation.eval_period_iterations > 0 
-            and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
+            cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
+            # and iteration != max_iter - 1
         ):
             do_test(cfg, model, f"training_{iteration}", process_group=process_subgroup)
             torch.cuda.synchronize()
@@ -868,8 +763,8 @@ def do_train(cfg, model, resume=True):
                     keep_checkpoint_copy(ckpt_dir / str(iteration))
 
         iteration = iteration + 1
-    
     metric_logger.synchronize_between_processes()
+
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 

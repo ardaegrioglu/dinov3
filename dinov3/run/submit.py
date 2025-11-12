@@ -28,7 +28,7 @@ def get_submitit_parser():
     parser = argparse.ArgumentParser("Submitit arguments", add_help=False)
     parser.add_argument(
         "--ngpus",
-        default=8,
+        default=2,
         type=int,
         help="Number of gpus to request on each node, default: %(default)s",
     )
@@ -118,6 +118,7 @@ def get_shared_folder() -> Path:
     if user_checkpoint_path is None:
         raise RuntimeError("Path to user checkpoint cannot be determined")
     path = user_checkpoint_path / "experiments"
+    path = Path("/mmfs1/gscratch/krishna/ardae/experiments")
     path.mkdir(exist_ok=True)
     return path
 
@@ -146,8 +147,19 @@ class CheckpointableSubmitter:
 
         job_env = submitit.JobEnvironment()
         self.output_dir = str(self.output_dir).replace("%j", str(job_env.job_id))
-        if "--output-dir" not in self.args:
-            self.args.insert(0, f"--output-dir={self.output_dir}")
+        # Check if this is an evaluation script
+        is_eval_script = "eval/" in self.module_path
+    
+         # Only add output_dir if not already specified
+        has_output_arg = any("output" in arg for arg in self.args)
+    
+        if not has_output_arg:
+            if is_eval_script:
+            # For evaluation scripts, use OmegaConf format (no dashes)
+                self.args.insert(0, f"output_dir={self.output_dir}")
+            else:
+            # For training scripts, use standard format (with dashes)
+                self.args.insert(0, f"--output-dir={self.output_dir}")
 
         # Setup logging with exact same arguments as in fairvit/run/init.py
         # to use lru_cache memoization and avoid setting up the logger twice
@@ -172,17 +184,20 @@ def submit_jobs(class_to_submit, output_dir, submitit_args, name="fairvit"):
 
     executor_params = get_slurm_executor_parameters(
         nodes=submitit_args.nodes,
+        ntasks_per_node=4,
         num_gpus_per_node=submitit_args.ngpus,
         timeout_min=submitit_args.timeout,  # max is 60 * 72
         slurm_signal_delay_s=120,
         slurm_partition=submitit_args.slurm_partition,
         slurm_qos=submitit_args.slurm_qos,
-        # slurm_account=submitit_args.slurm_account,
+        slurm_account=submitit_args.slurm_account,
         slurm_additional_parameters=dict(nice=submitit_args.slurm_nice),
         **kwargs,
     )
+    print(executor_params)
     executor.update_parameters(name=name, **executor_params)
     job = executor.submit(class_to_submit)
+    print(class_to_submit)
 
     logger.info(f"Submitted job_id: {job.job_id}")
     str_output_dir = os.path.abspath(output_dir).replace("%j", str(job.job_id))

@@ -45,10 +45,12 @@ def apply_scaling_rules_to_cfg(cfg):  # to fix
 
     if cfg.optim.scaling_rule == "linear_wrt_256":
         old_lr = cfg.optim.lr
+        #cfg.optim.lr *= cfg.train.batch_size_per_gpu * 1 / 256.0
         cfg.optim.lr *= cfg.train.batch_size_per_gpu * distributed.get_world_size() / 256.0
         logger.info(f"linear scaling learning rate; old: {old_lr}, new: {cfg.optim.lr}")
     elif cfg.optim.scaling_rule == "sqrt_wrt_1024":
         old_lr = cfg.optim.lr
+        #cfg.optim.lr *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * 1 / 1024.0)
         cfg.optim.lr *= 4 * math.sqrt(cfg.train.batch_size_per_gpu * distributed.get_world_size() / 1024.0)
         logger.info(f"sqrt scaling learning rate; old: {old_lr}, new: {cfg.optim.lr}")
     return cfg
@@ -74,6 +76,9 @@ def get_cfg_from_args(args: DinoV3SetupArgs, multidistillation=False, strict=Tru
         overrides.append(f"train.output_dir={os.path.realpath(args.output_dir)}")
 
     # Config file
+    print("config file:")
+    print(args.config_file)
+    print(args)
     cfg = OmegaConf.load(args.config_file)
 
     # Command line overrides
@@ -95,6 +100,7 @@ def setup_config(args: DinoV3SetupArgs, strict_cfg=True):
     Create configs and perform basic setups.
     """
     # Create the cfg with OmegaConf
+    print(args)
     cfg = get_cfg_from_args(args, strict=strict_cfg)
     # setup distributed, logging, and random seeds
     logger.info("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))

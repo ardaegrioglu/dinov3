@@ -1,0 +1,39 @@
+{
+  "backbone_name": "vitl16",
+  "checkpoint_path": "/mmfs1/gscratch/krishna/ardae/dinov3/output/eval/training_24999/teacher_checkpoint.pth",
+  "num_classes": 919,
+  "hidden_dim": 256,
+  "freeze_backbone": false,
+  
+  "dataset_path": "/mmfs1/gscratch/krishna/ardae/dinov3/ImageNet-S",
+  "input_resolution": 224,
+  "output_dir": "./outputs/mask2former_vitl_from_checkpoint",
+  
+  "batch_size": 16,
+  "num_workers": 8,
+  "epochs": 50,
+  "lr": 0.0001,
+  "backbone_lr_multiplier": 0.1,
+  "warmup_epochs": 5,
+  "weight_decay": 0.05,
+  "optimizer": "adamw",
+  "grad_clip": 1.0,
+  
+  "weight_class": 2.0,
+  "weight_mask": 5.0,
+  "weight_dice": 5.0,
+  "focal_alpha": 0.25,
+  "focal_gamma": 2.0,
+  
+  "checkpoint_period": 2500,
+  "eval_period_iterations": 1250,
+  "max_checkpoints_to_keep": 3,
+  
+  "use_wandb": false,
+  "wandb_project": "dinov3-mask2former-segmentation",
+  "wandb_run_name": "vitl_segmentationHead-25kCKpt",
+  "wandb_log_freq": 10,
+  
+  "resume": false,
+  "seed": 0
+}
